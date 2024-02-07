@@ -44,6 +44,7 @@ DEBUGFLAGS+=-Wall -Wextra -Wconversion -Wcast-qual -Wcast-align -Wshadow \
             -Wvla -Wformat=2 -Winit-self -Wfloat-equal -Wwrite-strings \
             -Wredundant-decls -Wstrict-overflow=2
 CFLAGS += $(DEBUGFLAGS) $(MOREFLAGS)
+CFLAGS += -lpthread 
 FLAGS   = $(CFLAGS) $(CPPFLAGS)
 XXHSUM_VERSION = $(LIBVER)
 UNAME := $(shell uname)

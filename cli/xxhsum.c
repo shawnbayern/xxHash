@@ -2,6 +2,22 @@
  * xxhsum - Command line interface for xxhash algorithms
  * Copyright (C) 2013-2023 Yann Collet
  *
+ * ==
+ * This file contains modifications to add multithreaded hash checking.
+ * Multiple threads may be used in -c mode when -P is specified on the
+ * command line; the number of threads can be specified (e.g., -P4), with
+ * 8 being the default when -P is specified.  Without -P, a single thread
+ * will be used for hash checking.
+ *
+ * As written, this version may add slightly more overhead in the single-
+ * threaded case, although it still may be useful in some environments
+ * because it slightly parallelizes filesystem operations and hash
+ * checking by separating those operations into separate threads.
+ * Obviously, it could be refactored to split out the multithreaded code
+ * entirely, so that when -P is not specified the execution path would be
+ * identical to the standard xxhsum. --Shawn Bayern
+ * ==
+ *
  * GPL v2 License
  *
  * This program is free software; you can redistribute it and/or modify
@@ -49,6 +65,7 @@
 #include <string.h>     /* strerror, strcmp, memcpy */
 #include <assert.h>     /* assert */
 #include <errno.h>      /* errno */
+#include <pthread.h>	/* threads */
 
 #define XXH_STATIC_LINKING_ONLY   /* *_state_t */
 #include "../xxhash.h"
@@ -56,6 +73,8 @@
 #ifdef XXHSUM_DISPATCH
 #  include "../xxh_x86dispatch.h"
 #endif
+
+extern char* strdup(const char*);
 
 static unsigned XSUM_isLittleEndian(void)
 {
@@ -101,6 +120,7 @@ typedef enum {
 
 static size_t XSUM_DEFAULT_SAMPLE_SIZE = 100 KB;
 
+#define NBTHREADS_DEFAULT (8)
 
 /* ********************************************************
 *  Filename (un)escaping
@@ -537,10 +557,19 @@ typedef struct {
     unsigned long   nMismatchedChecksums;
     unsigned long   nMatchedChecksums;
     unsigned long   nOpenOrReadFailures;
-    unsigned long   nMixedFormatLines;
     unsigned long   nMissing;
     int             quit;
 } ParseFileReport;
+
+typedef enum {
+    quit                = -1,
+    properlyFormatted   = 0,
+    improperlyFormatted = 1,
+    mismatchedChecksum  = 2,
+    matchedChecksum     = 3,
+    openOrReadFailure   = 4,
+    missing             = 5
+} ReportStatus;
 
 typedef struct {
     const char*     inFileName;
@@ -555,9 +584,27 @@ typedef struct {
     XSUM_U32        warn;
     XSUM_U32        quiet;
     XSUM_U32        algoBitmask;
+    XSUM_U32	    nbThreads;
     ParseFileReport report;
 } ParseFileArg;
 
+typedef struct {
+  ParseFileArg *XSUM_parseFileArg;
+  Canonical canonical;
+  char *filename;
+  AlgoSelected algo;
+  unsigned long lineNumber;
+} WorkerParameters;
+
+typedef struct {
+  WorkerParameters *workerParametersArray;
+  ParseFileReport *globalReport;
+  pthread_mutex_t workBufferMutex, reportMutex;
+  pthread_cond_t workConsumed, newWorkAvailable;
+  XSUM_U32 nbThreads;
+  XSUM_U32 workInBuffer;
+  int done;
+} WorkerContext;
 
 /*
  * Reads a line from stream `inFile`.
@@ -799,6 +846,173 @@ static ParseLineResult XSUM_parseLine(ParsedLine* parsedLine, char* line, int re
 }
 
 
+/*!
+ * Thread-safe worker function that validates hashes and produces appropriate output
+ */
+static ReportStatus XSUM_parseFileReentrant(ParseFileArg* XSUM_parseFileArg, Canonical canonical, char *filename, AlgoSelected algo, unsigned long lineNumber)
+{
+    const char* const inFileName = XSUM_parseFileArg->inFileName;
+    LineStatus lineStatus = LineStatus_hashFailed;
+    char* localBlockBuf;
+    Multihash xxh;
+
+    ReportStatus reportStatus = quit;
+
+    do {
+        int const fnameIsStdin = (strcmp(filename, stdinFileName) == 0); /* "stdin" */
+        FILE* const fp = fnameIsStdin ? stdin : XSUM_fopen(filename, "rb");
+        if (fp == stdin) {
+            XSUM_setBinaryMode(stdin);
+        }
+        if (fp == NULL) {
+            lineStatus = LineStatus_failedToOpen;
+            break;
+        }
+        lineStatus = LineStatus_hashFailed;
+        {   localBlockBuf = (char*) malloc(XSUM_parseFileArg->blockSize);
+            if (!localBlockBuf) {
+                XSUM_output("%s%lu: Error: out of memory.\n", inFileName, lineNumber);
+                    exit(1);
+            }
+            xxh = XSUM_hashStream(fp, algo, localBlockBuf, XSUM_parseFileArg->blockSize);
+            free(localBlockBuf);
+
+            switch (algo)
+            {
+            case algo_xxh32:
+                if (xxh.hash32 == XXH32_hashFromCanonical(&canonical.xxh32)) {
+                    lineStatus = LineStatus_hashOk;
+                }
+                break;
+
+            case algo_xxh64:
+            case algo_xxh3:
+                if (xxh.hash64 == XXH64_hashFromCanonical(&canonical.xxh64)) {
+                    lineStatus = LineStatus_hashOk;
+                }
+                break;
+
+            case algo_xxh128:
+                if (XXH128_isEqual(xxh.hash128, XXH128_hashFromCanonical(&canonical.xxh128))) {
+                    lineStatus = LineStatus_hashOk;
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+        if (fp != stdin) fclose(fp);
+    } while (0);
+
+    switch (lineStatus)
+    {
+    default:
+        XSUM_log("%s: Error: Unknown error.\n", inFileName);
+        return quit;
+        break;
+
+    case LineStatus_failedToOpen:
+        if (XSUM_parseFileArg->ignoreMissing) {
+            return missing;
+        } else {
+            if (!XSUM_parseFileArg->statusOnly) {
+                XSUM_output("%s:%lu: Could not open or read '%s': %s.\n",
+                    inFileName, lineNumber, filename, strerror(errno));
+            }
+            return openOrReadFailure;
+        }
+        break;
+
+    case LineStatus_hashOk:
+    case LineStatus_hashFailed:
+        {   int b = 1;
+            if (lineStatus == LineStatus_hashOk) {
+                reportStatus = matchedChecksum;
+                /* If --quiet is specified, don't display "OK" */
+                if (XSUM_parseFileArg->quiet) b = 0;
+            } else {
+                reportStatus = mismatchedChecksum;
+            }
+
+            if (b && !XSUM_parseFileArg->statusOnly) {
+                const int needsEscape = XSUM_filenameNeedsEscape(filename);
+                if (needsEscape) {
+                    XSUM_output("%c", '\\');
+                }
+                XSUM_printFilename(filename, needsEscape);
+                XSUM_output(": %s\n", lineStatus == LineStatus_hashOk ? "OK" : "FAILED");
+        }   }
+        break;
+    }
+    return reportStatus;
+}
+
+
+/*
+ * Manages a single worker thread.
+ */
+static void *workerThread(void *argument) {
+    XSUM_U32 threadCounter;
+    ReportStatus status;
+    WorkerContext *workerContext = (WorkerContext *) argument;
+    WorkerParameters ourTask;
+
+    while (!workerContext->globalReport->quit) {
+        /* safely retrieve and remove information representing a parsed line from the buffer */
+        pthread_mutex_lock(&workerContext->workBufferMutex);
+        while (workerContext->workInBuffer == 0) {
+            if (workerContext->done) {
+                pthread_mutex_unlock(&workerContext->workBufferMutex);
+                return 0;
+            }
+            pthread_cond_wait(&workerContext->newWorkAvailable, &workerContext->workBufferMutex);
+        }
+
+        for (threadCounter=0; threadCounter<workerContext->nbThreads; ++threadCounter)
+            if (workerContext->workerParametersArray[threadCounter].XSUM_parseFileArg)
+                break;
+        memcpy(&ourTask, &workerContext->workerParametersArray[threadCounter], sizeof(WorkerParameters));
+        workerContext->workerParametersArray[threadCounter].XSUM_parseFileArg = NULL;
+
+        assert(ourTask.XSUM_parseFileArg != NULL);
+        --workerContext->workInBuffer;
+        pthread_mutex_unlock(&workerContext->workBufferMutex);
+        pthread_cond_signal(&workerContext->workConsumed);
+
+        /* process the line */
+        status = XSUM_parseFileReentrant(ourTask.XSUM_parseFileArg, ourTask.canonical, ourTask.filename, ourTask.algo, ourTask.lineNumber);
+        free(ourTask.filename);
+
+        /* safely update the global report based on the result */
+        pthread_mutex_lock(&workerContext->reportMutex);
+        switch(status)
+        {
+        case quit:
+            workerContext->globalReport->quit = 1;
+            break;
+        case mismatchedChecksum:
+            workerContext->globalReport->nMismatchedChecksums++;
+            break;
+        case matchedChecksum:
+            workerContext->globalReport->nMatchedChecksums++;
+            break;
+        case openOrReadFailure:
+            workerContext->globalReport->nOpenOrReadFailures++;
+            break;
+        case missing:
+            workerContext->globalReport->nMissing++;
+            break;
+        case properlyFormatted:
+        case improperlyFormatted:
+            /* the worker code does not generate these; the lines have already been parsed for formatting */
+            assert(0);
+            break;
+        }
+        pthread_mutex_unlock(&workerContext->reportMutex);
+    }
+    return 0;
+}
 
 /*!
  * Parse xxHash checksum file.
@@ -807,12 +1021,40 @@ static void XSUM_parseFile1(ParseFileArg* XSUM_parseFileArg, int rev)
 {
     const char* const inFileName = XSUM_parseFileArg->inFileName;
     ParseFileReport* const report = &XSUM_parseFileArg->report;
-
     unsigned long lineNumber = 0;
+    XSUM_U32 threadCounter;
+    pthread_t *workerArray;
+    WorkerParameters *workerParametersArray;
+    WorkerContext workerContext;
+
     memset(report, 0, sizeof(*report));
 
+    workerArray = calloc(XSUM_parseFileArg->nbThreads, sizeof(pthread_t));
+    workerParametersArray = calloc(XSUM_parseFileArg->nbThreads, sizeof(WorkerParameters));
+
+    /*  ensure output lines don't interleave when using multiple threads */
+    if (XSUM_parseFileArg->nbThreads>1)
+        setenv("_STDBUF_O", "L", 1);
+
+    /* create the right number of threads and a buffer for them to find work */
+    workerContext.done = 0;
+    workerContext.workerParametersArray = workerParametersArray;
+    workerContext.globalReport = report;
+    pthread_mutex_init(&workerContext.workBufferMutex, NULL);
+    pthread_mutex_init(&workerContext.reportMutex, NULL);
+    pthread_cond_init(&workerContext.workConsumed, NULL);
+    pthread_cond_init(&workerContext.newWorkAvailable, NULL);
+    workerContext.nbThreads = XSUM_parseFileArg->nbThreads;
+    workerContext.workInBuffer = 0;
+    for (threadCounter=0; threadCounter<XSUM_parseFileArg->nbThreads; ++threadCounter) {
+       if (pthread_create(&workerArray[threadCounter], NULL, workerThread, &workerContext)) {
+           XSUM_log("%s:%lu: Error: Failed to create thread.\n",
+                   inFileName, lineNumber);
+           exit(1);
+       }
+    }
+
     while (!report->quit) {
-        LineStatus lineStatus = LineStatus_hashFailed;
         ParsedLine parsedLine;
         memset(&parsedLine, 0, sizeof(parsedLine));
 
@@ -864,6 +1106,7 @@ static void XSUM_parseFile1(ParseFileArg* XSUM_parseFileArg, int rev)
         }   }
 
         if (XSUM_parseLine(&parsedLine, XSUM_parseFileArg->lineBuf, rev, XSUM_parseFileArg->algoBitmask) != ParseLine_ok) {
+            /* this report field is updated only here, so there is no need to protect it with a mutex */
             report->nImproperlyFormattedLines++;
             if (XSUM_parseFileArg->warn) {
                 XSUM_log("%s:%lu: Error: Improperly formatted checksum line.\n",
@@ -872,89 +1115,52 @@ static void XSUM_parseFile1(ParseFileArg* XSUM_parseFileArg, int rev)
             continue;
         }
 
+        /* this report field is updated only here, so there is no need to protect it with a mutex */
         report->nProperlyFormattedLines++;
 
-        do {
-            int const fnameIsStdin = (strcmp(parsedLine.filename, stdinFileName) == 0); /* "stdin" */
-            FILE* const fp = fnameIsStdin ? stdin : XSUM_fopen(parsedLine.filename, "rb");
-            if (fp == stdin) {
-                XSUM_setBinaryMode(stdin);
-            }
-            if (fp == NULL) {
-                lineStatus = LineStatus_failedToOpen;
-                break;
-            }
-            lineStatus = LineStatus_hashFailed;
-            {   Multihash const xxh = XSUM_hashStream(fp, parsedLine.algo, XSUM_parseFileArg->blockBuf, XSUM_parseFileArg->blockSize);
-                switch (parsedLine.algo)
-                {
-                case algo_xxh32:
-                    if (xxh.hash32 == XXH32_hashFromCanonical(&parsedLine.canonical.xxh32)) {
-                        lineStatus = LineStatus_hashOk;
-                    }
-                    break;
-
-                case algo_xxh64:
-                case algo_xxh3:
-                    if (xxh.hash64 == XXH64_hashFromCanonical(&parsedLine.canonical.xxh64)) {
-                        lineStatus = LineStatus_hashOk;
-                    }
-                    break;
-
-                case algo_xxh128:
-                    if (XXH128_isEqual(xxh.hash128, XXH128_hashFromCanonical(&parsedLine.canonical.xxh128))) {
-                        lineStatus = LineStatus_hashOk;
-                    }
-                    break;
-
-                default:
-                    break;
-                }
-            }
-            if (fp != stdin) fclose(fp);
-        } while (0);
-
-        switch (lineStatus)
-        {
-        default:
-            XSUM_log("%s: Error: Unknown error.\n", inFileName);
-            report->quit = 1;
-            break;
-
-        case LineStatus_failedToOpen:
-            if (XSUM_parseFileArg->ignoreMissing) {
-                report->nMissing++;
-            } else {
-                report->nOpenOrReadFailures++;
-                if (!XSUM_parseFileArg->statusOnly) {
-                    XSUM_output("%s:%lu: Could not open or read '%s': %s.\n",
-                        inFileName, lineNumber, parsedLine.filename, strerror(errno));
-                }
-            }
-            break;
-
-        case LineStatus_hashOk:
-        case LineStatus_hashFailed:
-            {   int b = 1;
-                if (lineStatus == LineStatus_hashOk) {
-                    report->nMatchedChecksums++;
-                    /* If --quiet is specified, don't display "OK" */
-                    if (XSUM_parseFileArg->quiet) b = 0;
-                } else {
-                    report->nMismatchedChecksums++;
-                }
-
-                if (b && !XSUM_parseFileArg->statusOnly) {
-                    const int needsEscape = XSUM_filenameNeedsEscape(parsedLine.filename);
-                    if (needsEscape) {
-                        XSUM_output("%c", '\\');
-                    }
-                    XSUM_printFilename(parsedLine.filename, needsEscape);
-                    XSUM_output(": %s\n", lineStatus == LineStatus_hashOk ? "OK" : "FAILED");
-            }   }
-            break;
+        /* add the current line of work to the buffer */
+        pthread_mutex_lock(&workerContext.workBufferMutex);
+        while (workerContext.workInBuffer >= XSUM_parseFileArg->nbThreads) {
+            pthread_cond_wait(&workerContext.workConsumed, &workerContext.workBufferMutex);
         }
+
+        for (threadCounter=0; threadCounter<XSUM_parseFileArg->nbThreads; ++threadCounter)
+            if (!workerParametersArray[threadCounter].XSUM_parseFileArg)
+                break;
+        /* because of the conditional wait, there will be at least one spot for our set of parameters in the buffer */
+        assert(threadCounter<=XSUM_parseFileArg->nbThreads);
+
+        workerParametersArray[threadCounter].XSUM_parseFileArg = XSUM_parseFileArg;
+        workerParametersArray[threadCounter].canonical = parsedLine.canonical;
+        workerParametersArray[threadCounter].filename = strdup(parsedLine.filename);
+        if (!workerParametersArray[threadCounter].filename) {
+            XSUM_log("%s:%lu: Error: Out of memory.\n",
+                    inFileName, lineNumber);
+            exit(1);
+        }
+        workerParametersArray[threadCounter].algo = parsedLine.algo;
+        workerParametersArray[threadCounter].lineNumber = lineNumber;
+        ++workerContext.workInBuffer;
+        pthread_mutex_unlock(&workerContext.workBufferMutex);
+        if (pthread_cond_signal(&workerContext.newWorkAvailable))
+            XSUM_log("%s:%lu: Error: Thread management failed.\n",
+                    inFileName, lineNumber);
     }   /* while (!report->quit) */
+
+    /* wait for all threads to complete before returning */
+    workerContext.done = 1;
+    /* no new work is available, but this will cause the threads to notice we're done */
+    pthread_cond_broadcast(&workerContext.newWorkAvailable);
+    for (threadCounter=0; threadCounter<XSUM_parseFileArg->nbThreads; ++threadCounter) {
+       if (pthread_join(workerArray[threadCounter], NULL)) {
+            XSUM_log("%s:%lu: Error: Thread failed.\n",
+                    inFileName, lineNumber);
+            exit(1);
+       }
+   }
+
+   free(workerArray);
+   free(workerParametersArray);
 }
 
 
@@ -981,7 +1187,9 @@ static int XSUM_checkFile(const char* inFileName,
                           XSUM_U32 ignoreMissing,
                           XSUM_U32 warn,
                           XSUM_U32 quiet,
-                          XSUM_U32 algoBitmask)
+                          XSUM_U32 algoBitmask,
+                          XSUM_U32 nbThreads
+)
 {
     int result = 0;
     FILE* inFile = NULL;
@@ -1018,6 +1226,7 @@ static int XSUM_checkFile(const char* inFileName,
     XSUM_parseFileArg->warn        = warn;
     XSUM_parseFileArg->quiet       = quiet;
     XSUM_parseFileArg->algoBitmask = algoBitmask;
+    XSUM_parseFileArg->nbThreads   = nbThreads;
 
     if ( (XSUM_parseFileArg->lineBuf == NULL)
       || (XSUM_parseFileArg->blockBuf == NULL) ) {
@@ -1078,18 +1287,19 @@ static int XSUM_checkFiles(const char* fnList[], int fnTotal,
                            XSUM_U32 ignoreMissing,
                            XSUM_U32 warn,
                            XSUM_U32 quiet,
-                           XSUM_U32 algoBitmask)
+                           XSUM_U32 algoBitmask,
+                           XSUM_U32 nbThreads)
 {
     int ok = 1;
 
     /* Special case for stdinName "-",
      * note: stdinName is not a string.  It's special pointer. */
     if (fnTotal==0) {
-        ok &= XSUM_checkFile(stdinName, displayEndianess, strictMode, statusOnly, ignoreMissing, warn, quiet, algoBitmask);
+        ok &= XSUM_checkFile(stdinName, displayEndianess, strictMode, statusOnly, ignoreMissing, warn, quiet, algoBitmask, nbThreads);
     } else {
         int fnNb;
         for (fnNb=0; fnNb<fnTotal; fnNb++)
-            ok &= XSUM_checkFile(fnList[fnNb], displayEndianess, strictMode, statusOnly, ignoreMissing, warn, quiet, algoBitmask);
+            ok &= XSUM_checkFile(fnList[fnNb], displayEndianess, strictMode, statusOnly, ignoreMissing, warn, quiet, algoBitmask, nbThreads);
     }
     return ok ? 0 : 1;
 }
@@ -1136,6 +1346,7 @@ static int XSUM_usage_advanced(const char* exename)
     XSUM_log( "      --strict         Exit non-zero for improperly formatted checksum lines \n");
     XSUM_log( "      --warn           Warn about improperly formatted checksum lines \n");
     XSUM_log( "      --ignore-missing Don't fail or report status for missing files \n");
+    XSUM_log( " -P#                   Use # threads (default: %i when -P is specified, 1 otherwise) \n", NBTHREADS_DEFAULT);
     return 0;
 }
 
@@ -1228,6 +1439,7 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
     Display_endianess displayEndianess = big_endian;
     Display_convention convention = display_gnu;
     int nbIterations = NBLOOPS_DEFAULT;
+    XSUM_U32 nbThreads = 1;
 
     /* special case: xxhNNsum default to NN bits checksum */
     if (strstr(exename,  "xxh32sum") != NULL) { algo = g_defaultAlgo = algo_xxh32;  algoBitmask = algo_bitmask_xxh32;  }
@@ -1322,6 +1534,13 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
                 } while (*argument == ',');
                 break;
 
+            /* multiple threads */
+	    case 'P':
+                argument++;
+                if (!(nbThreads = (XSUM_U32)XSUM_readU32FromChar(&argument)))
+                    nbThreads = NBTHREADS_DEFAULT;
+                break;
+
             /* Modify Nb Iterations (benchmark only) */
             case 'i':
                 argument++;
@@ -1364,7 +1583,7 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
     if (filenamesStart==0) filenamesStart = argc;
     if (fileCheckMode) {
         return XSUM_checkFiles(argv+filenamesStart, argc-filenamesStart,
-                          displayEndianess, strictMode, statusOnly, ignoreMissing, warn, (XSUM_logLevel < 2) /*quiet*/, algoBitmask);
+                          displayEndianess, strictMode, statusOnly, ignoreMissing, warn, (XSUM_logLevel < 2) /*quiet*/, algoBitmask, nbThreads);
     } else {
         return XSUM_hashFiles(argv+filenamesStart, argc-filenamesStart, algo, displayEndianess, convention);
     }
